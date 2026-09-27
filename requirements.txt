@@ -1,0 +1,3 @@
+# Optional: system tray / menu bar icon
+pystray>=0.19
+pillow>=8.2
