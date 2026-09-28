@@ -559,17 +559,28 @@ class AccountDialog(tk.Toplevel):
             messagebox.showinfo(APP_NAME, "Signed in to SmartThings.", parent=self)
 
 
-def nudge_repaint(win):
+def nudge_repaint(win, _tries=0):
     """Work around a Tk/Cocoa bug (still present in the Tcl/Tk builds several
     python.org installers bundle) where a window's contents render blank on
-    macOS while the system is in Dark Mode. A 1px resize forces Tk to repaint
-    it; the window snaps back to its real size a moment later."""
-    if not IS_MAC:
+    macOS while the system is in Dark Mode. Tk sometimes finishes drawing a
+    window without telling the compositor to display it; a resize alone can
+    get coalesced away with no visible effect, so also toggle alpha, which
+    forces Cocoa to recomposite the window's layer."""
+    if not IS_MAC or not win.winfo_exists():
         return
-    win.update_idletasks()
-    w, h = win.winfo_width(), win.winfo_height()
-    win.geometry(f"{w}x{h + 1}")
-    win.after(10, lambda: win.geometry(f"{w}x{h}"))
+    if not win.winfo_viewable() and _tries < 20:
+        win.after(25, lambda: nudge_repaint(win, _tries + 1))
+        return
+    try:
+        win.update_idletasks()
+        w, h = win.winfo_width(), win.winfo_height()
+        win.attributes("-alpha", 0.0)
+        win.geometry(f"{w}x{h + 1}")
+        win.update_idletasks()
+        win.geometry(f"{w}x{h}")
+        win.attributes("-alpha", 1.0)
+    except tk.TclError:
+        pass
 
 
 # ---------------------------------------------------------------- main window
