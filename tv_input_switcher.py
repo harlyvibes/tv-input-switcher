@@ -881,6 +881,24 @@ class App(tk.Tk):
                     lambda: self.api.command(dev, "switch", state), done)
 
 
+def warn_if_apple_system_python():
+    """Apple's system Python (/usr/bin/python3) bundles Tk 8.5, which predates
+    Dark Mode and is known to render windows blank or unresizable on modern
+    macOS. That broken Tk build can't reliably show a dialog about itself, so
+    print straight to the terminal instead."""
+    if IS_MAC and sys.executable in ("/usr/bin/python3", "/usr/bin/python"):
+        print(
+            "Warning: running under macOS's built-in Python at "
+            f"{sys.executable}. It bundles an old Tcl/Tk with serious "
+            "display bugs on modern macOS (blank or unresizable windows, "
+            "especially in Dark Mode).\n"
+            "Install Python from https://python.org/downloads/macos/ and "
+            "run this script with THAT python3 instead.",
+            file=sys.stderr,
+        )
+
+
 if __name__ == "__main__":
     mp.freeze_support()
+    warn_if_apple_system_python()
     App().mainloop()

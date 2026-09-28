@@ -6,7 +6,7 @@ Works on Windows, macOS and Linux, using only the Python standard library (plus 
 
 ## Requirements
 
-- Python 3.8 or newer with Tkinter (included with the python.org installers; on macOS, use python.org or Homebrew Python rather than the system one)
+- Python 3.8 or newer with Tkinter (included with the python.org installers). **On macOS, do not use the system Python at `/usr/bin/python3`** — it bundles an old Tcl/Tk with serious display bugs on modern macOS (windows can render completely blank or refuse to resize, especially in Dark Mode). Install Python from [python.org/downloads/macos](https://www.python.org/downloads/macos/) (or `brew install python-tk`) and run the script with that `python3` instead.
 - A SmartThings account with your TV added to it
 - Optional, for the tray / menu bar icon: `pystray` and `pillow`
 
@@ -70,4 +70,4 @@ The tray icon runs in its own helper process, because macOS requires both Tkinte
 - **"SmartThings rejected the sign-in":** your personal access token has expired, or your OAuth sign-in lapsed. Open **Account…** and sign in again.
 - **No TVs found:** make sure the TV appears in the SmartThings app on your phone under the same Samsung account.
 - **Inputs missing or out of date:** SmartThings may not update while the TV is off. Turn it on and click **Refresh**.
-- **Blank window on macOS in Dark Mode:** this is a known bug in some Tcl/Tk builds where windows render blank while the system is in Dark Mode. The app works around it automatically by nudging the window size right after it appears. If a window still looks blank, resize it slightly or switch focus away and back; installing a current Python from python.org (which bundles a newer Tcl/Tk) also fixes it for good.
+- **Blank window on macOS, especially if it also won't resize:** you're almost certainly running macOS's built-in Python (`/usr/bin/python3`), which bundles Tk 8.5 — it predates Dark Mode and has serious, unfixable-from-inside-the-app display bugs on modern macOS. Check with `which python3`; if it prints `/usr/bin/python3`, install Python from [python.org/downloads/macos](https://www.python.org/downloads/macos/) and run the script with that `python3` instead. The app also prints a warning to the terminal on startup if it detects this.
