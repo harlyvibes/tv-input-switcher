@@ -70,3 +70,4 @@ The tray icon runs in its own helper process, because macOS requires both Tkinte
 - **"SmartThings rejected the sign-in":** your personal access token has expired, or your OAuth sign-in lapsed. Open **Account…** and sign in again.
 - **No TVs found:** make sure the TV appears in the SmartThings app on your phone under the same Samsung account.
 - **Inputs missing or out of date:** SmartThings may not update while the TV is off. Turn it on and click **Refresh**.
+- **Blank window on macOS in Dark Mode:** this is a known bug in some Tcl/Tk builds where windows render blank while the system is in Dark Mode. The app works around it automatically by nudging the window size right after it appears. If a window still looks blank, resize it slightly or switch focus away and back; installing a current Python from python.org (which bundles a newer Tcl/Tk) also fixes it for good.

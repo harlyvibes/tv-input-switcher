@@ -475,6 +475,7 @@ class AccountDialog(tk.Toplevel):
 
         self._toggle()
         self.grab_set()
+        nudge_repaint(self)
 
     def _toggle(self):
         oauth = self.mode.get() == "oauth"
@@ -558,6 +559,19 @@ class AccountDialog(tk.Toplevel):
             messagebox.showinfo(APP_NAME, "Signed in to SmartThings.", parent=self)
 
 
+def nudge_repaint(win):
+    """Work around a Tk/Cocoa bug (still present in the Tcl/Tk builds several
+    python.org installers bundle) where a window's contents render blank on
+    macOS while the system is in Dark Mode. A 1px resize forces Tk to repaint
+    it; the window snaps back to its real size a moment later."""
+    if not IS_MAC:
+        return
+    win.update_idletasks()
+    w, h = win.winfo_width(), win.winfo_height()
+    win.geometry(f"{w}x{h + 1}")
+    win.after(10, lambda: win.geometry(f"{w}x{h}"))
+
+
 # ---------------------------------------------------------------- main window
 class App(tk.Tk):
     def __init__(self):
@@ -620,6 +634,8 @@ class App(tk.Tk):
             self.after(200, self.open_account)
         else:
             self.load_tvs()
+
+        self.after(50, lambda: nudge_repaint(self))
 
     # ---- tray communication
     def start_tray(self):
@@ -693,6 +709,7 @@ class App(tk.Tk):
         self.attributes("-topmost", True)
         self.after(150, lambda: self.attributes("-topmost", False))
         self.focus_force()
+        nudge_repaint(self)
 
     def quit_app(self):
         if self.tray_proc is not None:
