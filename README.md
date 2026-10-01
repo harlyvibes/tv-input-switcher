@@ -65,6 +65,8 @@ On every *other* computer, open **Network…** and add the master's IP address t
 
 This sync is **plain, unencrypted JSON over TCP** on port `53934` — there's no login, no TLS, nothing standing between a message and being applied. That's a deliberate simplicity trade-off for a trusted home network; don't expose that port to the internet, and don't run master mode on a network you don't trust.
 
+**Network…** also has debugging tools: it shows whether this computer is actually listening for pushes, when it last received one and from whom, and a **Check network** button that pings every device in the list and reports back online/unreachable (and whether each one is currently the master).
+
 ## How it works
 
 The app calls the SmartThings API over HTTPS:

@@ -357,6 +357,10 @@ class TokenSyncServer:
 
     def __init__(self, app):
         self.app = app
+        self.listening = None  # None = still starting, then True/False
+        self.error = None
+        self.last_seen_from = None  # IP that most recently pushed us tokens
+        self.last_seen_at = None  # time.time() of that push
         threading.Thread(target=self._serve, daemon=True).start()
 
     def _serve(self):
@@ -366,16 +370,19 @@ class TokenSyncServer:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             sock.bind(("0.0.0.0", port))
             sock.listen(5)
-        except OSError:
+        except OSError as e:
+            self.listening = False
+            self.error = str(e)
             return
+        self.listening = True
         while True:
             try:
-                conn, _addr = sock.accept()
+                conn, addr = sock.accept()
             except OSError:
                 return
-            threading.Thread(target=self._handle, args=(conn,), daemon=True).start()
+            threading.Thread(target=self._handle, args=(conn, addr[0]), daemon=True).start()
 
-    def _handle(self, conn):
+    def _handle(self, conn, addr):
         try:
             with conn:
                 conn.settimeout(5)
@@ -385,11 +392,38 @@ class TokenSyncServer:
                     if not chunk:
                         break
                     data += chunk
-            msg = json.loads(data.decode())
+                msg = json.loads(data.decode())
+                if msg.get("type") == "ping":
+                    reply = {"type": "pong", "master_mode": bool(self.app.cfg.get("master_mode"))}
+                    conn.sendall((json.dumps(reply) + "\n").encode())
+                    return
         except Exception:
             return
         if msg.get("type") == "tokens" and isinstance(msg.get("auth"), dict):
+            self.last_seen_from = addr
+            self.last_seen_at = time.time()
             self.app.after(0, lambda: self.app.apply_synced_auth(msg["auth"]))
+
+
+def check_peer(peer, default_port, timeout=1.5):
+    """Try to reach one peer's sync server with a ping, for the Network
+    window's "Check network" button. Returns a small status dict."""
+    host, _, p = peer.strip().partition(":")
+    port = int(p) if p.isdigit() else default_port
+    try:
+        with socket.create_connection((host, port), timeout=timeout) as s:
+            s.sendall(b'{"type": "ping"}\n')
+            s.settimeout(timeout)
+            data = b""
+            while not data.endswith(b"\n") and len(data) < 4096:
+                chunk = s.recv(4096)
+                if not chunk:
+                    break
+                data += chunk
+        reply = json.loads(data.decode()) if data else {}
+        return {"peer": peer, "online": True, "master": bool(reply.get("master_mode"))}
+    except Exception:
+        return {"peer": peer, "online": False, "master": False}
 
 
 def push_tokens_to_peers(cfg):
@@ -698,9 +732,14 @@ class NetworkDialog(tk.Toplevel):
         frm = ttk.Frame(self, padding=12)
         frm.pack(fill="both", expand=True)
 
-        port = app.cfg.get("sync_port", DEFAULT_SYNC_PORT)
-        ttk.Label(frm, text=f"This computer: {local_ip()}:{port}", foreground="#888").grid(
+        self.port = app.cfg.get("sync_port", DEFAULT_SYNC_PORT)
+        self.conn_var = tk.StringVar()
+        ttk.Label(frm, textvariable=self.conn_var, foreground="#888").grid(
             row=0, column=0, columnspan=2, sticky="w")
+
+        self.last_push_var = tk.StringVar()
+        ttk.Label(frm, textvariable=self.last_push_var, foreground="#888").grid(
+            row=1, column=0, columnspan=2, sticky="w")
 
         self.master_var = tk.BooleanVar(value=bool(app.cfg.get("master_mode")))
         ttk.Checkbutton(
@@ -708,13 +747,13 @@ class NetworkDialog(tk.Toplevel):
             text="Make this computer the master\n"
                  "(refreshes sign-in and shares it with the devices below)",
             variable=self.master_var, command=self._toggle_master,
-        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(10, 0))
+        ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(10, 0))
 
         ttk.Label(frm, text="Other devices on the network (IP address):").grid(
-            row=2, column=0, columnspan=2, sticky="w", pady=(12, 2))
+            row=3, column=0, columnspan=2, sticky="w", pady=(12, 2))
 
         list_frame = ttk.Frame(frm)
-        list_frame.grid(row=3, column=0, columnspan=2, sticky="nsew")
+        list_frame.grid(row=4, column=0, columnspan=2, sticky="nsew")
         self.listbox = tk.Listbox(list_frame, height=6, width=34, exportselection=False)
         self.listbox.pack(side="left", fill="both", expand=True)
         sb = ttk.Scrollbar(list_frame, command=self.listbox.yview)
@@ -724,26 +763,80 @@ class NetworkDialog(tk.Toplevel):
             self.listbox.insert("end", peer)
 
         btns = ttk.Frame(frm)
-        btns.grid(row=4, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        btns.grid(row=5, column=0, columnspan=2, sticky="w", pady=(6, 0))
         ttk.Button(btns, text="Add…", command=self._add).pack(side="left")
         ttk.Button(btns, text="Edit…", command=self._edit).pack(side="left", padx=6)
         ttk.Button(btns, text="Remove", command=self._remove).pack(side="left")
+        self.check_btn = ttk.Button(btns, text="Check network", command=self._check_network)
+        self.check_btn.pack(side="left", padx=(12, 0))
+
+        self.status_var = tk.StringVar(value="Click \"Check network\" to test these devices.")
+        ttk.Label(frm, textvariable=self.status_var, foreground="#444",
+                  wraplength=320, justify="left").grid(
+            row=6, column=0, columnspan=2, sticky="w", pady=(8, 0))
 
         ttk.Label(
             frm,
-            text=f"Sync port {port} must be the same on every device. No "
+            text=f"Sync port {self.port} must be the same on every device. No "
                  "encryption is used — keep this on a trusted home network.",
             foreground="#666", wraplength=320, justify="left",
-        ).grid(row=5, column=0, columnspan=2, sticky="w", pady=(10, 0))
+        ).grid(row=7, column=0, columnspan=2, sticky="w", pady=(10, 0))
 
         close_row = ttk.Frame(frm)
-        close_row.grid(row=6, column=0, columnspan=2, sticky="e", pady=(14, 0))
+        close_row.grid(row=8, column=0, columnspan=2, sticky="e", pady=(14, 0))
         ttk.Button(close_row, text="Close", command=self.destroy).pack(side="right")
 
+        self._refresh_local_status()
         nudge_repaint(self)
 
     def _toggle_master(self):
         self.app.set_master_mode(self.master_var.get())
+
+    # ---- debugging tools
+    def _refresh_local_status(self):
+        srv = self.app.sync_server
+        if srv.listening is True:
+            status = "listening for pushes"
+        elif srv.listening is False:
+            status = f"NOT listening ({srv.error or 'unknown error'})"
+        else:
+            status = "starting…"
+            self.after(300, self._refresh_local_status)
+        self.conn_var.set(f"This computer: {local_ip()}:{self.port} — {status}")
+
+        if srv.last_seen_from:
+            when = time.strftime("%H:%M:%S", time.localtime(srv.last_seen_at))
+            self.last_push_var.set(f"Last sign-in received from {srv.last_seen_from} at {when}")
+        else:
+            self.last_push_var.set("No sign-in received from another device yet")
+
+    def _check_network(self):
+        self._refresh_local_status()
+        peers = list(self.listbox.get(0, "end"))
+        if not peers:
+            self.status_var.set("No devices added yet — click \"Add…\" first.")
+            return
+        self.check_btn.config(state="disabled")
+        self.status_var.set("Checking…")
+        port = self.port
+
+        def work():
+            results = [check_peer(p, port) for p in peers]
+            self.after(0, lambda: self._show_check_results(results))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _show_check_results(self, results):
+        if not self.winfo_exists():
+            return
+        self.check_btn.config(state="normal")
+        lines = []
+        for r in results:
+            if r["online"]:
+                lines.append(f"✓ {r['peer']} — online" + (", master" if r["master"] else ""))
+            else:
+                lines.append(f"✗ {r['peer']} — unreachable")
+        self.status_var.set("\n".join(lines))
 
     def _add(self):
         ip = simpledialog.askstring("Add device", "IP address (optionally ip:port):", parent=self)
