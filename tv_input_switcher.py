@@ -506,8 +506,24 @@ def tray_process(state_q, cmd_q):
     """Runs in a separate process: owns the tray / menu bar icon.
 
     Receives state snapshots on `state_q` (None means exit) and sends
-    user commands as tuples on `cmd_q`.
+    user commands as tuples on `cmd_q`. Wrapped so a crash here — which would
+    otherwise vanish silently, especially now that the launching terminal is
+    hidden — leaves a trace on disk instead.
     """
+    try:
+        _run_tray(state_q, cmd_q)
+    except Exception:
+        import traceback
+        try:
+            with open(Path.home() / ".tv_input_switcher_tray_error.log", "a",
+                      encoding="utf-8") as f:
+                f.write(f"\n--- {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n")
+                traceback.print_exc(file=f)
+        except Exception:
+            pass
+
+
+def _run_tray(state_q, cmd_q):
     call_on_main = lambda fn: fn()  # noqa: E731
     if IS_MAC:
         try:
@@ -1034,6 +1050,17 @@ class App(tk.Tk):
         self.tray_proc = None
         if HAVE_TRAY:
             self.start_tray()
+        else:
+            # Most common cause: pystray/pillow are installed for a
+            # *different* Python than the one running this script right now
+            # (e.g. after switching away from macOS's system Python).
+            self.after(300, lambda: messagebox.showwarning(
+                APP_NAME,
+                "No tray icon / menu bar icon: the \"pystray\" and \"pillow\" "
+                f"packages aren't installed for this Python ({sys.executable}).\n\n"
+                "Install them for that same Python and restart:\n"
+                "    pip install -r requirements.txt\n\n"
+                "The app still works without them, just without the tray icon."))
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         if IS_MAC:
             self.createcommand("tk::mac::Quit", self.quit_app)
