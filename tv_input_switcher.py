@@ -397,6 +397,13 @@ class TokenSyncServer:
                     reply = {"type": "pong", "master_mode": bool(self.app.cfg.get("master_mode"))}
                     conn.sendall((json.dumps(reply) + "\n").encode())
                     return
+                if msg.get("type") == "request_push":
+                    # Only reply if we're the master: a non-master's tokens
+                    # may be stale, and could overwrite a fresher sign-in.
+                    if self.app.cfg.get("master_mode"):
+                        reply = {"type": "tokens", "auth": dict(self.app.cfg["auth"])}
+                        conn.sendall((json.dumps(reply) + "\n").encode())
+                    return
         except Exception:
             return
         if msg.get("type") == "tokens" and isinstance(msg.get("auth"), dict):
@@ -448,6 +455,36 @@ def push_tokens_to_peers(cfg):
                 pass
 
     threading.Thread(target=work, daemon=True).start()
+
+
+def request_push_from_peers(cfg, default_port, timeout=2):
+    """Ask every configured peer to push its sign-in back to us right now,
+    for the Network window's "Request now" button. Only a peer with master
+    mode on will actually reply. Returns {peer: auth_dict} for every peer
+    that did."""
+    got = {}
+    for peer in list(cfg.get("peers", [])):
+        host, _, p = peer.strip().partition(":")
+        if not host:
+            continue
+        port = int(p) if p.isdigit() else default_port
+        try:
+            with socket.create_connection((host, port), timeout=timeout) as s:
+                s.sendall(b'{"type": "request_push"}\n')
+                s.settimeout(timeout)
+                data = b""
+                while not data.endswith(b"\n") and len(data) < 65536:
+                    chunk = s.recv(4096)
+                    if not chunk:
+                        break
+                    data += chunk
+            if data:
+                reply = json.loads(data.decode())
+                if reply.get("type") == "tokens" and isinstance(reply.get("auth"), dict):
+                    got[peer] = reply["auth"]
+        except Exception:
+            pass
+    return got
 
 
 # ---------------------------------------------------------------- tray process
@@ -767,23 +804,30 @@ class NetworkDialog(tk.Toplevel):
         ttk.Button(btns, text="Add…", command=self._add).pack(side="left")
         ttk.Button(btns, text="Edit…", command=self._edit).pack(side="left", padx=6)
         ttk.Button(btns, text="Remove", command=self._remove).pack(side="left")
-        self.check_btn = ttk.Button(btns, text="Check network", command=self._check_network)
-        self.check_btn.pack(side="left", padx=(12, 0))
+
+        sync_btns = ttk.Frame(frm)
+        sync_btns.grid(row=6, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        self.check_btn = ttk.Button(sync_btns, text="Check network", command=self._check_network)
+        self.check_btn.pack(side="left")
+        self.push_btn = ttk.Button(sync_btns, text="Push now", command=self._force_push)
+        self.push_btn.pack(side="left", padx=6)
+        self.request_btn = ttk.Button(sync_btns, text="Request now", command=self._request_push)
+        self.request_btn.pack(side="left")
 
         self.status_var = tk.StringVar(value="Click \"Check network\" to test these devices.")
         ttk.Label(frm, textvariable=self.status_var, foreground="#444",
                   wraplength=320, justify="left").grid(
-            row=6, column=0, columnspan=2, sticky="w", pady=(8, 0))
+            row=7, column=0, columnspan=2, sticky="w", pady=(8, 0))
 
         ttk.Label(
             frm,
             text=f"Sync port {self.port} must be the same on every device. No "
                  "encryption is used — keep this on a trusted home network.",
             foreground="#666", wraplength=320, justify="left",
-        ).grid(row=7, column=0, columnspan=2, sticky="w", pady=(10, 0))
+        ).grid(row=8, column=0, columnspan=2, sticky="w", pady=(10, 0))
 
         close_row = ttk.Frame(frm)
-        close_row.grid(row=8, column=0, columnspan=2, sticky="e", pady=(14, 0))
+        close_row.grid(row=9, column=0, columnspan=2, sticky="e", pady=(14, 0))
         ttk.Button(close_row, text="Close", command=self.destroy).pack(side="right")
 
         self._refresh_local_status()
@@ -837,6 +881,47 @@ class NetworkDialog(tk.Toplevel):
             else:
                 lines.append(f"✗ {r['peer']} — unreachable")
         self.status_var.set("\n".join(lines))
+
+    def _force_push(self):
+        """Send this computer's current sign-in to every peer right now,
+        regardless of master mode — useful for testing the connection."""
+        peers = list(self.listbox.get(0, "end"))
+        if not peers:
+            self.status_var.set("No devices added yet — click \"Add…\" first.")
+            return
+        push_tokens_to_peers(self.app.cfg)
+        self.status_var.set(f"Pushed this computer's sign-in to {len(peers)} device(s).")
+
+    def _request_push(self):
+        """Ask every peer to push its sign-in back to us right now, instead
+        of waiting for its next scheduled refresh."""
+        peers = list(self.listbox.get(0, "end"))
+        if not peers:
+            self.status_var.set("No devices added yet — click \"Add…\" first.")
+            return
+        self.request_btn.config(state="disabled")
+        self.status_var.set("Requesting a sign-in from the network…")
+        cfg = self.app.cfg
+
+        def work():
+            got = request_push_from_peers(cfg, self.port)
+            self.after(0, lambda: self._request_done(got))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _request_done(self, got):
+        if not self.winfo_exists():
+            return
+        self.request_btn.config(state="normal")
+        if not got:
+            self.status_var.set(
+                "No device responded with a sign-in. Make sure one of them "
+                "has \"Master\" turned on.")
+            return
+        peer, auth = next(iter(got.items()))
+        self.app.apply_synced_auth(auth)
+        extra = f" (and {len(got) - 1} more)" if len(got) > 1 else ""
+        self.status_var.set(f"Received a fresh sign-in from {peer}{extra}.")
 
     def _add(self):
         ip = simpledialog.askstring("Add device", "IP address (optionally ip:port):", parent=self)

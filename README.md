@@ -65,7 +65,11 @@ On every *other* computer, open **Network…** and add the master's IP address t
 
 This sync is **plain, unencrypted JSON over TCP** on port `53934` — there's no login, no TLS, nothing standing between a message and being applied. That's a deliberate simplicity trade-off for a trusted home network; don't expose that port to the internet, and don't run master mode on a network you don't trust.
 
-**Network…** also has debugging tools: it shows whether this computer is actually listening for pushes, when it last received one and from whom, and a **Check network** button that pings every device in the list and reports back online/unreachable (and whether each one is currently the master).
+**Network…** also has debugging tools: it shows whether this computer is actually listening for pushes, when it last received one and from whom, and three buttons —
+
+- **Check network**: pings every device in the list and reports back online/unreachable (and whether each one is currently the master).
+- **Push now**: sends this computer's sign-in to every device immediately, regardless of master mode. Useful for testing the connection without waiting for a token refresh.
+- **Request now**: asks every device to send its sign-in back to us right now, instead of waiting. Only a device with **Master** turned on will actually reply.
 
 ## How it works
 
