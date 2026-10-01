@@ -335,6 +335,20 @@ def capture_code_locally(redirect_uri, state, timeout=180):
 
 
 # ---------------------------------------------------------------- local network sync
+def local_ip():
+    """This computer's LAN IP address, so it can be entered as a peer on
+    other instances. Doesn't actually send anything: connecting a UDP socket
+    just asks the OS which local address would be used for that route."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        return s.getsockname()[0]
+    except OSError:
+        return "127.0.0.1"
+    finally:
+        s.close()
+
+
 class TokenSyncServer:
     """Listens on the local network for sign-in pushes from whichever instance
     has "master" mode on, and applies them here. Plain JSON over TCP, with no
@@ -684,19 +698,23 @@ class NetworkDialog(tk.Toplevel):
         frm = ttk.Frame(self, padding=12)
         frm.pack(fill="both", expand=True)
 
+        port = app.cfg.get("sync_port", DEFAULT_SYNC_PORT)
+        ttk.Label(frm, text=f"This computer: {local_ip()}:{port}", foreground="#888").grid(
+            row=0, column=0, columnspan=2, sticky="w")
+
         self.master_var = tk.BooleanVar(value=bool(app.cfg.get("master_mode")))
         ttk.Checkbutton(
             frm,
             text="Make this computer the master\n"
                  "(refreshes sign-in and shares it with the devices below)",
             variable=self.master_var, command=self._toggle_master,
-        ).grid(row=0, column=0, columnspan=2, sticky="w")
+        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(10, 0))
 
         ttk.Label(frm, text="Other devices on the network (IP address):").grid(
-            row=1, column=0, columnspan=2, sticky="w", pady=(12, 2))
+            row=2, column=0, columnspan=2, sticky="w", pady=(12, 2))
 
         list_frame = ttk.Frame(frm)
-        list_frame.grid(row=2, column=0, columnspan=2, sticky="nsew")
+        list_frame.grid(row=3, column=0, columnspan=2, sticky="nsew")
         self.listbox = tk.Listbox(list_frame, height=6, width=34, exportselection=False)
         self.listbox.pack(side="left", fill="both", expand=True)
         sb = ttk.Scrollbar(list_frame, command=self.listbox.yview)
@@ -706,21 +724,20 @@ class NetworkDialog(tk.Toplevel):
             self.listbox.insert("end", peer)
 
         btns = ttk.Frame(frm)
-        btns.grid(row=3, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        btns.grid(row=4, column=0, columnspan=2, sticky="w", pady=(6, 0))
         ttk.Button(btns, text="Add…", command=self._add).pack(side="left")
         ttk.Button(btns, text="Edit…", command=self._edit).pack(side="left", padx=6)
         ttk.Button(btns, text="Remove", command=self._remove).pack(side="left")
 
         ttk.Label(
             frm,
-            text=f"Sync port {app.cfg.get('sync_port', DEFAULT_SYNC_PORT)} must be the "
-                 "same on every device. No encryption is used — keep this on a "
-                 "trusted home network.",
+            text=f"Sync port {port} must be the same on every device. No "
+                 "encryption is used — keep this on a trusted home network.",
             foreground="#666", wraplength=320, justify="left",
-        ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(10, 0))
+        ).grid(row=5, column=0, columnspan=2, sticky="w", pady=(10, 0))
 
         close_row = ttk.Frame(frm)
-        close_row.grid(row=5, column=0, columnspan=2, sticky="e", pady=(14, 0))
+        close_row.grid(row=6, column=0, columnspan=2, sticky="e", pady=(14, 0))
         ttk.Button(close_row, text="Close", command=self.destroy).pack(side="right")
 
         nudge_repaint(self)
@@ -814,6 +831,10 @@ class App(tk.Tk):
         self.account_btn.pack(side="left", padx=(4, 0))
         self.network_btn = ttk.Button(top, text="Network…", command=self.open_network)
         self.network_btn.pack(side="left", padx=(4, 0))
+
+        port = self.cfg.get("sync_port", DEFAULT_SYNC_PORT)
+        ttk.Label(self, text=f"This computer: {local_ip()}:{port}", foreground="#888").pack(
+            anchor="w", padx=10)
 
         power = ttk.Frame(self)
         power.pack(fill="x", **pad)
