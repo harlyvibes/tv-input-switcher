@@ -37,6 +37,8 @@ import os
 import queue
 import re
 import secrets
+import socket
+import subprocess
 import sys
 import threading
 import time
@@ -69,6 +71,10 @@ DEFAULT_REDIRECT = "https://httpbin.org/get"
 TOKENS_PAGE = "https://account.smartthings.com/tokens"
 HTTP_TIMEOUT = 20
 
+# Local-network sign-in sync: plain JSON over TCP, no encryption or auth.
+# Every instance listens on this port; only a "master" instance ever sends.
+DEFAULT_SYNC_PORT = 53934
+
 # Capabilities Samsung TVs use for input selection (standard one first).
 INPUT_CAPS = ("mediaInputSource", "samsungvd.mediaInputSource")
 
@@ -100,6 +106,10 @@ def load_config():
     cfg["auth"].setdefault("mode", "pat")
     cfg["auth"].setdefault("redirect_uri", DEFAULT_REDIRECT)
     cfg.setdefault("device_id", None)
+    cfg.setdefault("master_mode", False)
+    cfg.setdefault("peers", [])
+    cfg.setdefault("sync_port", DEFAULT_SYNC_PORT)
+    cfg.setdefault("default_switch", {})
     return cfg
 
 
@@ -324,6 +334,74 @@ def capture_code_locally(redirect_uri, state, timeout=180):
     return result.get("code")
 
 
+# ---------------------------------------------------------------- local network sync
+class TokenSyncServer:
+    """Listens on the local network for sign-in pushes from whichever instance
+    has "master" mode on, and applies them here. Plain JSON over TCP, with no
+    encryption and no authentication — this is meant for a trusted home LAN
+    only, never the open internet."""
+
+    def __init__(self, app):
+        self.app = app
+        threading.Thread(target=self._serve, daemon=True).start()
+
+    def _serve(self):
+        port = self.app.cfg.get("sync_port", DEFAULT_SYNC_PORT)
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind(("0.0.0.0", port))
+            sock.listen(5)
+        except OSError:
+            return
+        while True:
+            try:
+                conn, _addr = sock.accept()
+            except OSError:
+                return
+            threading.Thread(target=self._handle, args=(conn,), daemon=True).start()
+
+    def _handle(self, conn):
+        try:
+            with conn:
+                conn.settimeout(5)
+                data = b""
+                while not data.endswith(b"\n") and len(data) < 65536:
+                    chunk = conn.recv(4096)
+                    if not chunk:
+                        break
+                    data += chunk
+            msg = json.loads(data.decode())
+        except Exception:
+            return
+        if msg.get("type") == "tokens" and isinstance(msg.get("auth"), dict):
+            self.app.after(0, lambda: self.app.apply_synced_auth(msg["auth"]))
+
+
+def push_tokens_to_peers(cfg):
+    """Send the current sign-in to every configured peer, in a background
+    thread. Plain TCP, no encryption: local network only, by design."""
+    peers = list(cfg.get("peers", []))
+    if not peers:
+        return
+    payload = (json.dumps({"type": "tokens", "auth": dict(cfg["auth"])}) + "\n").encode()
+    port_default = cfg.get("sync_port", DEFAULT_SYNC_PORT)
+
+    def work():
+        for peer in peers:
+            host, _, p = peer.strip().partition(":")
+            if not host:
+                continue
+            port = int(p) if p.isdigit() else port_default
+            try:
+                with socket.create_connection((host, port), timeout=3) as s:
+                    s.sendall(payload)
+            except OSError:
+                pass
+
+    threading.Thread(target=work, daemon=True).start()
+
+
 # ---------------------------------------------------------------- tray process
 def make_tray_image(size=64):
     """Draw a simple TV icon so no image file is needed."""
@@ -359,12 +437,16 @@ def tray_process(state_q, cmd_q):
         except Exception:
             pass
 
-    snap = {"tvs": [], "device": None, "inputs": [], "current": None}
+    snap = {
+        "tvs": [], "device": None, "inputs": [], "current": None,
+        "default_device": None, "default_input": None, "default_label": None,
+        "master_mode": False,
+    }
 
     def send(*msg):
         return lambda icon, item: cmd_q.put(msg)
 
-    def device_items():
+    def tv_items():
         if not snap["tvs"]:
             yield pystray.MenuItem("(no TVs found yet)", None, enabled=False)
             return
@@ -382,20 +464,48 @@ def tray_process(state_q, cmd_q):
                                    checked=lambda item, s=src_id: snap["current"] == s,
                                    radio=True)
 
-    menu = pystray.Menu(
-        pystray.MenuItem("Show window", send("show"), default=True),
-        pystray.Menu.SEPARATOR,
-        pystray.MenuItem("Device", pystray.Menu(device_items)),
-        pystray.MenuItem("Input", pystray.Menu(input_items)),
-        pystray.Menu.SEPARATOR,
-        pystray.MenuItem("Power On", send("power", "on")),
-        pystray.MenuItem("Power Off", send("power", "off")),
-        pystray.MenuItem("Refresh", send("refresh")),
-        pystray.MenuItem("Reload device list", send("reload")),
-        pystray.Menu.SEPARATOR,
-        pystray.MenuItem("Quit", send("quit")),
-    )
-    icon = pystray.Icon("tv_input_switcher", make_tray_image(), APP_NAME, menu)
+    def default_items():
+        if not snap["inputs"]:
+            yield pystray.MenuItem("(refresh to load inputs)", None, enabled=False)
+            return
+        dev = snap["device"]
+        for src_id, name in snap["inputs"]:
+            yield pystray.MenuItem(
+                name, send("set_default", dev, src_id, name),
+                checked=lambda item, s=src_id: (
+                    snap["default_device"] == dev and snap["default_input"] == s
+                ),
+                radio=True,
+            )
+
+    def default_text():
+        if snap["default_input"]:
+            return f"Switch to {snap['default_label'] or snap['default_input']}"
+        return "Switch to… (set a default below)"
+
+    def root_items():
+        # Fires when the tray icon itself is clicked, not just the menu item.
+        yield pystray.MenuItem(default_text(), send("switch_default"),
+                               default=True, enabled=bool(snap["default_input"]))
+        yield pystray.Menu.SEPARATOR
+        yield from tv_items()
+        yield pystray.Menu.SEPARATOR
+        yield pystray.MenuItem("Default switch device", pystray.Menu(default_items))
+        yield pystray.MenuItem("Input", pystray.Menu(input_items))
+        yield pystray.Menu.SEPARATOR
+        yield pystray.MenuItem("Power On", send("power", "on"))
+        yield pystray.MenuItem("Power Off", send("power", "off"))
+        yield pystray.MenuItem("Refresh", send("refresh"))
+        yield pystray.MenuItem("Reload device list", send("reload"))
+        yield pystray.Menu.SEPARATOR
+        yield pystray.MenuItem("Master (share sign-in on the network)", send("toggle_master"),
+                               checked=lambda item: snap["master_mode"])
+        yield pystray.MenuItem("Network devices…", send("network"))
+        yield pystray.Menu.SEPARATOR
+        yield pystray.MenuItem("Show window", send("show"))
+        yield pystray.MenuItem("Quit", send("quit"))
+
+    icon = pystray.Icon("tv_input_switcher", make_tray_image(), APP_NAME, pystray.Menu(root_items))
 
     def listen():
         while True:
@@ -559,6 +669,97 @@ class AccountDialog(tk.Toplevel):
             messagebox.showinfo(APP_NAME, "Signed in to SmartThings.", parent=self)
 
 
+# ---------------------------------------------------------------- network dialog
+class NetworkDialog(tk.Toplevel):
+    """Toggle master mode and manage the IP addresses of other instances on
+    the local network. Sync is plain, unencrypted TCP — local network only."""
+
+    def __init__(self, app):
+        super().__init__(app)
+        self.app = app
+        self.title("Network")
+        self.resizable(False, False)
+        self.transient(app)
+
+        frm = ttk.Frame(self, padding=12)
+        frm.pack(fill="both", expand=True)
+
+        self.master_var = tk.BooleanVar(value=bool(app.cfg.get("master_mode")))
+        ttk.Checkbutton(
+            frm,
+            text="Make this computer the master\n"
+                 "(refreshes sign-in and shares it with the devices below)",
+            variable=self.master_var, command=self._toggle_master,
+        ).grid(row=0, column=0, columnspan=2, sticky="w")
+
+        ttk.Label(frm, text="Other devices on the network (IP address):").grid(
+            row=1, column=0, columnspan=2, sticky="w", pady=(12, 2))
+
+        list_frame = ttk.Frame(frm)
+        list_frame.grid(row=2, column=0, columnspan=2, sticky="nsew")
+        self.listbox = tk.Listbox(list_frame, height=6, width=34, exportselection=False)
+        self.listbox.pack(side="left", fill="both", expand=True)
+        sb = ttk.Scrollbar(list_frame, command=self.listbox.yview)
+        sb.pack(side="left", fill="y")
+        self.listbox.config(yscrollcommand=sb.set)
+        for peer in app.cfg.get("peers", []):
+            self.listbox.insert("end", peer)
+
+        btns = ttk.Frame(frm)
+        btns.grid(row=3, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        ttk.Button(btns, text="Add…", command=self._add).pack(side="left")
+        ttk.Button(btns, text="Edit…", command=self._edit).pack(side="left", padx=6)
+        ttk.Button(btns, text="Remove", command=self._remove).pack(side="left")
+
+        ttk.Label(
+            frm,
+            text=f"Sync port {app.cfg.get('sync_port', DEFAULT_SYNC_PORT)} must be the "
+                 "same on every device. No encryption is used — keep this on a "
+                 "trusted home network.",
+            foreground="#666", wraplength=320, justify="left",
+        ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(10, 0))
+
+        close_row = ttk.Frame(frm)
+        close_row.grid(row=5, column=0, columnspan=2, sticky="e", pady=(14, 0))
+        ttk.Button(close_row, text="Close", command=self.destroy).pack(side="right")
+
+        nudge_repaint(self)
+
+    def _toggle_master(self):
+        self.app.set_master_mode(self.master_var.get())
+
+    def _add(self):
+        ip = simpledialog.askstring("Add device", "IP address (optionally ip:port):", parent=self)
+        ip = (ip or "").strip()
+        if ip:
+            self.listbox.insert("end", ip)
+            self._save()
+
+    def _edit(self):
+        sel = self.listbox.curselection()
+        if not sel:
+            return
+        ip = simpledialog.askstring(
+            "Edit device", "IP address (optionally ip:port):",
+            initialvalue=self.listbox.get(sel[0]), parent=self,
+        )
+        ip = (ip or "").strip()
+        if ip:
+            self.listbox.delete(sel[0])
+            self.listbox.insert(sel[0], ip)
+            self._save()
+
+    def _remove(self):
+        sel = self.listbox.curselection()
+        if sel:
+            self.listbox.delete(sel[0])
+            self._save()
+
+    def _save(self):
+        self.app.cfg["peers"] = list(self.listbox.get(0, "end"))
+        save_config(self.app.cfg)
+
+
 def nudge_repaint(win, _tries=0):
     """Work around a Tk/Cocoa bug (still present in the Tcl/Tk builds several
     python.org installers bundle) where a window's contents render blank on
@@ -592,11 +793,12 @@ class App(tk.Tk):
         self.resizable(True, False)
 
         self.cfg = load_config()
-        self.auth = SmartThingsAuth(self.cfg["auth"], lambda: save_config(self.cfg))
+        self.auth = SmartThingsAuth(self.cfg["auth"], self._on_auth_changed)
         self.api = SmartThingsAPI(self.auth)
         self.tvs = []  # [(id, label)]
         self.state_info = None
         self.busy = False
+        self.sync_server = TokenSyncServer(self)
 
         pad = {"padx": 10, "pady": 6}
 
@@ -610,6 +812,8 @@ class App(tk.Tk):
         self.refresh_btn.pack(side="left")
         self.account_btn = ttk.Button(top, text="Account…", command=self.open_account)
         self.account_btn.pack(side="left", padx=(4, 0))
+        self.network_btn = ttk.Button(top, text="Network…", command=self.open_network)
+        self.network_btn.pack(side="left", padx=(4, 0))
 
         power = ttk.Frame(self)
         power.pack(fill="x", **pad)
@@ -688,6 +892,16 @@ class App(tk.Tk):
             self.refresh_state()
         elif action == "reload":
             self.load_tvs()
+        elif action == "set_default":
+            dev_id, src_id, label = args
+            self.cfg["default_switch"] = {"device_id": dev_id, "input": src_id, "label": label}
+            save_config(self.cfg)
+        elif action == "switch_default":
+            self.switch_default()
+        elif action == "toggle_master":
+            self.set_master_mode(not self.cfg.get("master_mode", False))
+        elif action == "network":
+            self.open_network()
         elif action == "quit":
             self.quit_app()
             return
@@ -697,12 +911,17 @@ class App(tk.Tk):
         if not self.tray_alive():
             return
         info = self.state_info or {}
+        d = self.cfg.get("default_switch") or {}
         try:
             self.tray_state_q.put({
                 "tvs": list(self.tvs),
                 "device": self.current_device(),
                 "inputs": list(info.get("inputs", [])),
                 "current": info.get("current"),
+                "default_device": d.get("device_id"),
+                "default_input": d.get("input"),
+                "default_label": d.get("label"),
+                "master_mode": bool(self.cfg.get("master_mode")),
             })
         except Exception:
             pass
@@ -737,6 +956,56 @@ class App(tk.Tk):
     def open_account(self):
         self.show_window()
         AccountDialog(self)
+
+    def open_network(self):
+        self.show_window()
+        NetworkDialog(self)
+
+    # ---- local network sign-in sync
+    def _on_auth_changed(self):
+        """Called (from any thread) whenever the stored tokens change."""
+        save_config(self.cfg)
+        if self.cfg.get("master_mode"):
+            push_tokens_to_peers(self.cfg)
+
+    def apply_synced_auth(self, auth):
+        """Called on the UI thread when a master pushes us fresh tokens."""
+        self.cfg["auth"].update(auth)
+        save_config(self.cfg)
+        self.status_var.set("Received a fresh sign-in from the network master.")
+
+    def set_master_mode(self, enabled):
+        self.cfg["master_mode"] = bool(enabled)
+        save_config(self.cfg)
+        self.update_tray()
+        if enabled:
+            push_tokens_to_peers(self.cfg)
+
+    def switch_default(self):
+        d = self.cfg.get("default_switch") or {}
+        dev, src, label = d.get("device_id"), d.get("input"), d.get("label")
+        if not dev or not src:
+            self.show_window()
+            messagebox.showinfo(
+                APP_NAME,
+                "No default switch device set yet.\n\n"
+                "Right-click the tray icon → \"Default switch device\" to choose one.",
+            )
+            return
+
+        def work():
+            cap = (self.state_info or {}).get("cap") if dev == self.current_device() else None
+            if not cap:
+                cap = self.api.tv_state(dev)["cap"]
+            self.api.command(dev, cap, "setInputSource", src)
+
+        def done(_):
+            self.status_var.set(f"Switched to {label or src}")
+            if dev == self.current_device() and self.state_info:
+                self.state_info["current"] = src
+                self.build_input_buttons()
+
+        self.run_bg(f"Switching to {label or src}…", work, done)
 
     def keep_alive(self):
         threading.Thread(target=lambda: self._quietly(self.auth.keep_alive), daemon=True).start()
@@ -783,7 +1052,7 @@ class App(tk.Tk):
 
     def set_controls_enabled(self, enabled):
         st = "normal" if enabled else "disabled"
-        for w in (self.refresh_btn, self.on_btn, self.off_btn, self.account_btn):
+        for w in (self.refresh_btn, self.on_btn, self.off_btn, self.account_btn, self.network_btn):
             w.config(state=st)
         self.tv_combo.config(state="readonly" if enabled else "disabled")
         for w in self.inputs_frame.winfo_children():
@@ -898,7 +1167,30 @@ def warn_if_apple_system_python():
         )
 
 
+def hide_launching_terminal():
+    """Best-effort: hide the console/terminal window used to start the app,
+    since it's meant to run quietly in the tray from here on."""
+    if IS_WIN:
+        try:
+            import ctypes
+            hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+            if hwnd:
+                ctypes.windll.user32.ShowWindow(hwnd, 0)  # SW_HIDE
+        except Exception:
+            pass
+    elif IS_MAC and os.environ.get("TERM_PROGRAM") == "Apple_Terminal":
+        try:
+            subprocess.run(
+                ["osascript", "-e",
+                 'tell application "Terminal" to set miniaturized of front window to true'],
+                capture_output=True, timeout=3,
+            )
+        except Exception:
+            pass
+
+
 if __name__ == "__main__":
     mp.freeze_support()
     warn_if_apple_system_python()
+    hide_launching_terminal()
     App().mainloop()

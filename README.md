@@ -47,9 +47,23 @@ If you'd rather not paste the code, register the redirect URI as `http://localho
 
 ## Using it
 
-The app lists every device on your SmartThings account that supports input switching. Pick your TV, then click an input; the active one is marked with ●. Right-click the tray icon (or click the menu bar icon on macOS) for the same controls. Closing the window hides it to the tray; choose **Quit** from the icon's menu to exit. Your selected TV and sign-in are saved in `~/.tv_input_switcher.json`. That file contains your tokens, so keep it private.
+The app lists every device on your SmartThings account that supports input switching. Pick your TV, then click an input; the active one is marked with ●. Right-click the tray icon (or click the menu bar icon on macOS) for the same controls, plus the TV list itself, right at the top of the menu. Closing the window hides it to the tray; choose **Quit** from the icon's menu to exit. Your selected TV and sign-in are saved in `~/.tv_input_switcher.json`. That file contains your tokens, so keep it private.
 
 The TV must be on to change inputs. For **Power On** to work, turn on **Power On with Mobile** (or IP Remote / Network Standby) in the TV's settings.
+
+The terminal window used to launch the app hides itself shortly after startup (on macOS, only if it's Terminal.app — it's minimized, not closed).
+
+### One-click switching
+
+Right-click the tray icon → **Default switch device** to pick one input as your default (for whichever TV is currently selected). After that, just clicking the tray icon — no menu needed — switches straight to it. **Show window** moves into the right-click menu so the window is still one click away when you need it.
+
+### Keeping multiple computers in sync
+
+If you run this app on more than one computer on the same network (e.g. a desktop and a laptop), only one sign-in needs to stay fresh. Right-click the tray icon (or open **Network…**) and turn on **Master** on whichever computer you want to own the SmartThings sign-in; it will refresh its tokens as usual and push them out to the other computers whenever they change.
+
+On every *other* computer, open **Network…** and add the master's IP address to the device list (no need to turn master mode on there — every instance is always listening for a push, whether or not it's the master).
+
+This sync is **plain, unencrypted JSON over TCP** on port `53934` — there's no login, no TLS, nothing standing between a message and being applied. That's a deliberate simplicity trade-off for a trusted home network; don't expose that port to the internet, and don't run master mode on a network you don't trust.
 
 ## How it works
 
